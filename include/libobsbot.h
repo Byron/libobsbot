@@ -107,7 +107,7 @@ typedef struct ObsbotStatus {
    */
   int32_t saturation;
   /**
-   * Current zoom value (raw u16 cast to f32 for now).
+   * Current zoom value in raw UVC units (u16 cast to f32).
    */
   float zoom;
   /**
@@ -310,7 +310,7 @@ int obsbot_device_exposure_time(struct ObsbotDevice *handle, uint32_t *out_value
 int obsbot_device_set_pan_tilt(struct ObsbotDevice *handle, float pan, float tilt);
 
 /**
- * Set zoom as a u16-clamped objective focal length.
+ * Set raw UVC zoom units, truncating fractional input; not a magnification factor.
  */
 int obsbot_device_set_zoom(struct ObsbotDevice *handle, float zoom);
 
@@ -456,7 +456,7 @@ int obsbot_device_white_balance(struct ObsbotDevice *handle, int *out_mode, uint
 int obsbot_device_pan_tilt(struct ObsbotDevice *handle, float *out_pan, float *out_tilt);
 
 /**
- * Read current zoom value.
+ * Read current raw UVC zoom units as a float; not a magnification factor.
  */
 int obsbot_device_zoom(struct ObsbotDevice *handle, float *out);
 

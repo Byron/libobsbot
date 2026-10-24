@@ -16,7 +16,7 @@ use std::fs::File;
 use crate::discovery::DeviceInfo;
 use crate::transport::Transport;
 use crate::uvc::UvcGet;
-use crate::Result;
+use crate::{Error, ProductType, Result};
 
 /// UVC class-specific `SET_CUR` `bRequest`.
 const SET_CUR: u8 = 0x01;
@@ -31,6 +31,12 @@ pub(crate) struct UsbTransport {
 
 impl UsbTransport {
     pub(crate) fn open(info: &DeviceInfo) -> Result<Self> {
+        // uvcvideo's cached zoom readback cannot confirm Tiny 3 commands.
+        if info.product_type == ProductType::Tiny3 {
+            return Err(Error::Unsupported(
+                "Tiny 3 control is currently supported on macOS only",
+            ));
+        }
         let v4l2 = super::uvcvideo::open_for(info.busnum, info.devnum)?;
         tracing::debug!(
             vid = format_args!("{:04x}", info.vendor_id),
@@ -80,5 +86,21 @@ impl Transport for UsbTransport {
             return result;
         }
         super::uvcvideo::xu_query(&self.v4l2, entity, selector, req as u8, out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiny3_is_rejected_before_opening_the_linux_video_node() {
+        let mut info = crate::testing::meet2_mock_info();
+        info.product_type = ProductType::Tiny3;
+        info.product_id = 0xff02;
+        assert!(matches!(
+            UsbTransport::open(&info),
+            Err(Error::Unsupported(_))
+        ));
     }
 }

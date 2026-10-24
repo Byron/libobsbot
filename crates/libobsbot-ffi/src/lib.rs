@@ -37,7 +37,7 @@ pub const OBSBOT_ERR_BAD_RESPONSE: c_int = -7;
 
 fn map_error(err: &Error) -> c_int {
     match err {
-        Error::NotFound => OBSBOT_ERR_NOT_FOUND,
+        Error::NotFound | Error::DeviceSelection(_) => OBSBOT_ERR_NOT_FOUND,
         Error::Timeout => OBSBOT_ERR_TIMEOUT,
         Error::Unsupported(_) => OBSBOT_ERR_UNSUPPORTED,
         Error::OutOfRange => OBSBOT_ERR_OUT_OF_RANGE,
@@ -449,7 +449,7 @@ pub unsafe extern "C" fn obsbot_device_set_pan_tilt(
     with_device(handle, |d| d.set_pan_tilt(pan, tilt))
 }
 
-/// Set zoom as a u16-clamped objective focal length.
+/// Set raw UVC zoom units, truncating fractional input; not a magnification factor.
 #[no_mangle]
 pub unsafe extern "C" fn obsbot_device_set_zoom(handle: *mut ObsbotDevice, zoom: f32) -> c_int {
     with_device(handle, |d| d.set_zoom(zoom))
@@ -789,7 +789,7 @@ pub unsafe extern "C" fn obsbot_device_pan_tilt(
     }
 }
 
-/// Read current zoom value.
+/// Read current raw UVC zoom units as a float; not a magnification factor.
 #[no_mangle]
 pub unsafe extern "C" fn obsbot_device_zoom(handle: *mut ObsbotDevice, out: *mut f32) -> c_int {
     read_into(handle, out, Device::zoom)
@@ -817,7 +817,7 @@ pub struct ObsbotStatus {
     pub contrast: i32,
     /// Saturation reported by the Processing Unit.
     pub saturation: i32,
-    /// Current zoom value (raw u16 cast to f32 for now).
+    /// Current zoom value in raw UVC units (u16 cast to f32).
     pub zoom: f32,
     /// Normalised pan in -1.0..=1.0.
     pub pan: f32,
@@ -1088,7 +1088,7 @@ mod tests {
             let p = obsbot_version();
             assert!(!p.is_null());
             let s = std::ffi::CStr::from_ptr(p).to_str().unwrap();
-            assert!(!s.is_empty());
+            assert_ne!(s, "");
         }
     }
 

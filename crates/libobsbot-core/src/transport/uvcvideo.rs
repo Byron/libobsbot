@@ -176,6 +176,7 @@ pub(super) fn v4l2_get(
         UvcGet::Cur => v4l2_g_ctrl(fd, cid).map(i32::to_le_bytes),
         UvcGet::Min => v4l2_queryctrl(fd, cid).map(|q| q.minimum.to_le_bytes()),
         UvcGet::Max => v4l2_queryctrl(fd, cid).map(|q| q.maximum.to_le_bytes()),
+        UvcGet::Res => v4l2_queryctrl(fd, cid).map(|q| q.step.to_le_bytes()),
     };
     Some(result.map(|bytes| {
         let n = bytes.len().min(out.len());
@@ -200,8 +201,8 @@ fn pantilt_set(fd: &File, payload: &[u8]) -> Result<()> {
 }
 
 /// Combine the two V4L2 PAN/TILT controls back into UVC's packed 8-byte
-/// `(i32 pan, i32 tilt)` representation. For `Min`/`Max`, each axis's own
-/// range is returned packed together.
+/// `(i32 pan, i32 tilt)` representation. For `Min`/`Max`/`Res`, each axis's
+/// own range or step is returned packed together.
 fn pantilt_get(fd: &File, req: UvcGet, out: &mut [u8]) -> Result<usize> {
     if out.len() < 8 {
         return Err(Error::Usb(format!(
@@ -221,6 +222,10 @@ fn pantilt_get(fd: &File, req: UvcGet, out: &mut [u8]) -> Result<usize> {
         UvcGet::Max => (
             v4l2_queryctrl(fd, V4L2_CID_PAN_ABSOLUTE)?.maximum,
             v4l2_queryctrl(fd, V4L2_CID_TILT_ABSOLUTE)?.maximum,
+        ),
+        UvcGet::Res => (
+            v4l2_queryctrl(fd, V4L2_CID_PAN_ABSOLUTE)?.step,
+            v4l2_queryctrl(fd, V4L2_CID_TILT_ABSOLUTE)?.step,
         ),
     };
     out[..4].copy_from_slice(&pan.to_le_bytes());

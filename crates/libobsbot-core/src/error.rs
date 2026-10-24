@@ -35,6 +35,10 @@ pub enum Error {
     #[error("not found")]
     NotFound,
 
+    /// No camera, an unknown ID, or an ambiguous camera selection.
+    #[error("{0}")]
+    DeviceSelection(String),
+
     /// Argument value lies outside the camera's accepted range.
     #[error("out of range")]
     OutOfRange,

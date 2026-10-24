@@ -22,6 +22,10 @@
 #![cfg(target_os = "macos")]
 
 use std::ffi::c_void;
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::sync::Mutex;
 
 use core_foundation::base::{CFType, TCFType};
@@ -39,7 +43,6 @@ use io_kit_sys::{
     IOServiceGetMatchingServices, IOServiceMatching,
 };
 
-use crate::devices::meet2;
 use crate::types::ProductType;
 use crate::uvc::UvcGet;
 use crate::{Error, Result};
@@ -258,6 +261,7 @@ fn k_iousb_device_interface_id() -> CFUUIDRef {
 /// paths.
 pub struct MacosTransport {
     inner: Mutex<TransportInner>,
+    _control_lock: Option<File>,
 }
 
 struct TransportInner {
@@ -291,6 +295,13 @@ impl MacosTransport {
     /// `DeviceRequestTO`s don't require an exclusive device claim and we
     /// don't want to fight `UVCAssistant`.
     pub fn open(info: &crate::discovery::DeviceInfo) -> Result<Self> {
+        let control_lock = if info.product_type == ProductType::Tiny3 {
+            let path =
+                std::env::temp_dir().join(format!("libobsbot-tiny3-{:x}.lock", info.registry_id));
+            Some(lock_control(&path)?)
+        } else {
+            None
+        };
         let device_service = lookup_service_by_registry_id(info.registry_id)?;
         let _device_release = ServiceRelease(device_service);
 
@@ -321,8 +332,34 @@ impl MacosTransport {
                 dev,
                 interface_number,
             }),
+            _control_lock: control_lock,
         })
     }
+}
+
+// Keep the file in place: unlinking it could let another process lock a different inode.
+fn lock_control(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|err| Error::Usb(format!("open Tiny 3 control lock: {err}")))?;
+    // SAFETY: the descriptor is live; flock changes only its advisory lock state.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(Error::Usb(
+            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                "Tiny 3 is busy in another obsbot handle or process; retry after it closes".into()
+            } else {
+                format!("lock Tiny 3 controls: {err}")
+            },
+        ));
+    }
+    Ok(file)
 }
 
 impl super::Transport for MacosTransport {
@@ -661,21 +698,17 @@ fn matching_iter() -> Option<IOObject> {
 /// and assemble a [`crate::discovery::DeviceInfo`]. Returns `None` if a
 /// required property is missing or the product id is not one we know.
 fn device_info_from_service(service: io_service_t) -> Option<crate::discovery::DeviceInfo> {
-    let vendor_id = read_u32_property(service, "idVendor")?;
-    let product_id = read_u32_property(service, "idProduct")?;
-    if vendor_id != u32::from(meet2::VENDOR_ID) {
-        return None;
-    }
-    let product_type = match u16::try_from(product_id).ok()? {
-        meet2::PRODUCT_ID_MEET2 => ProductType::Meet2,
-        _ => return None,
-    };
+    let vendor_id = u16::try_from(read_u32_property(service, "idVendor")?).ok()?;
+    let product_id = u16::try_from(read_u32_property(service, "idProduct")?).ok()?;
+    let product_type = ProductType::from_usb_ids(vendor_id, product_id)?;
     let serial = read_string_property(service, "USB Serial Number").unwrap_or_default();
     let registry_id = registry_entry_id(service)?;
     Some(crate::discovery::DeviceInfo {
-        vendor_id: u16::try_from(vendor_id).ok()?,
-        product_id: u16::try_from(product_id).ok()?,
+        vendor_id,
+        product_id,
         product_type,
+        product_name: read_string_property(service, "USB Product Name").unwrap_or_default(),
+        manufacturer: read_string_property(service, "USB Vendor Name").unwrap_or_default(),
         serial,
         registry_id,
     })
@@ -730,6 +763,26 @@ fn registry_entry_id(entry: io_registry_entry_t) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_lock_is_exclusive_and_released_on_drop() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "libobsbot-control-lock-test-{}-{unique}",
+            std::process::id()
+        ));
+        let first = lock_control(&path).unwrap();
+        assert!(lock_control(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("busy"));
+        drop(first);
+        drop(lock_control(&path).unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn request_layout_matches_apple_usb_headers() {

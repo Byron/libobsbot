@@ -16,6 +16,10 @@ pub struct DeviceInfo {
     pub product_id: u16,
     /// Camera model.
     pub product_type: ProductType,
+    /// USB product string, when available.
+    pub product_name: String,
+    /// USB manufacturer string, when available.
+    pub manufacturer: String,
     /// Device serial number, when the OS exposes it. Empty when unknown
     /// (the Meet 2 sets `iSerial = 0` in its USB descriptor, so no serial
     /// is available before opening; the camera reports one at runtime).
@@ -27,12 +31,32 @@ pub struct DeviceInfo {
     pub(crate) devnum: u8,
 
     /// `IOKit` registry id of the matched USB device on macOS - used
-    /// to re-open the same device from a `DeviceInfo` even if the
-    /// enumeration order changed. Read by `MacosTransport::open`,
-    /// which lands in a follow-up commit.
+    /// to re-open the same device even if enumeration order changed.
     #[cfg(target_os = "macos")]
-    #[allow(dead_code)]
     pub(crate) registry_id: u64,
+}
+
+impl DeviceInfo {
+    /// ID for selecting this physical USB camera across process invocations.
+    /// It remains valid while connected; reconnecting can change the ID.
+    #[must_use]
+    pub fn id(&self) -> String {
+        #[cfg(target_os = "macos")]
+        {
+            format!("usb-{:x}", self.registry_id)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            format!("usb-{}-{}", self.busnum, self.devnum)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            format!(
+                "usb-{:04x}-{:04x}-{}",
+                self.vendor_id, self.product_id, self.serial
+            )
+        }
+    }
 }
 
 /// Owns the hot-plug watcher and the registry of connected cameras.
@@ -67,6 +91,12 @@ impl Devices {
         enumerate()
     }
 
+    /// Select a connected camera by [`DeviceInfo::id`], or select the only
+    /// connected supported camera when `id` is `None`.
+    pub fn select(&self, id: Option<&str>) -> Result<DeviceInfo> {
+        select_device(&self.list(), id).cloned()
+    }
+
     /// Find a connected camera by serial number.
     #[must_use]
     pub fn by_serial(&self, sn: &str) -> Option<DeviceInfo> {
@@ -76,15 +106,11 @@ impl Devices {
     /// Open a connected camera for control.
     pub fn open(&self, info: &DeviceInfo) -> Result<Device> {
         let transport: Arc<dyn crate::transport::Transport> = open_transport(info)?;
-        // Bootstrap: learn the device's MAC tail before constructing
-        // the Device. The MAC-query handshake doesn't itself need a
-        // MAC, so it's safe to issue on a freshly opened camera.
-        let mac = crate::device::learn_mac(transport.as_ref())?;
-        tracing::debug!(
-            mac = ?format!("{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]),
-            "learned device MAC"
-        );
+        let mac = match info.product_type {
+            ProductType::Meet2 => crate::device::learn_mac(transport.as_ref())?,
+            // Tiny 3 frames do not contain the Meet 2 MAC address.
+            ProductType::Tiny3 => [0; 6],
+        };
         Ok(Device::new(
             info.clone(),
             transport,
@@ -115,16 +141,34 @@ impl Drop for Devices {
 /// Live enumeration of OBSBOT cameras, regardless of platform.
 fn enumerate() -> Vec<DeviceInfo> {
     #[cfg(target_os = "linux")]
-    {
-        linux::enumerate()
-    }
+    let devices = linux::enumerate();
     #[cfg(target_os = "macos")]
-    {
-        crate::transport::macos::enumerate()
-    }
+    let devices = crate::transport::macos::enumerate();
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        Vec::new()
+    let devices = Vec::new();
+    deduplicate(devices)
+}
+
+fn deduplicate(mut devices: Vec<DeviceInfo>) -> Vec<DeviceInfo> {
+    devices.sort_by_cached_key(DeviceInfo::id);
+    devices.dedup_by_key(|d| d.id());
+    devices
+}
+
+fn select_device<'a>(devices: &'a [DeviceInfo], id: Option<&str>) -> Result<&'a DeviceInfo> {
+    if let Some(id) = id {
+        return devices.iter().find(|d| d.id() == id).ok_or_else(|| {
+            crate::Error::DeviceSelection(format!("no supported camera with device ID {id:?}"))
+        });
+    }
+    match devices {
+        [] => Err(crate::Error::DeviceSelection(
+            "no supported OBSBOT camera connected".into(),
+        )),
+        [device] => Ok(device),
+        _ => Err(crate::Error::DeviceSelection(
+            "multiple supported cameras connected; select a device ID explicitly".into(),
+        )),
     }
 }
 
@@ -169,10 +213,8 @@ fn hotplug_loop(tx: &crossbeam_channel::Sender<Event>, stop: &std::sync::atomic:
     use std::collections::HashMap;
     let mut known: HashMap<String, DeviceInfo> = HashMap::new();
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-        let current: HashMap<String, DeviceInfo> = enumerate()
-            .into_iter()
-            .map(|d| (device_key(&d), d))
-            .collect();
+        let current: HashMap<String, DeviceInfo> =
+            enumerate().into_iter().map(|d| (d.id(), d)).collect();
         // Additions.
         for (k, info) in &current {
             if !known.contains_key(k)
@@ -211,27 +253,9 @@ fn hotplug_loop(tx: &crossbeam_channel::Sender<Event>, stop: &std::sync::atomic:
     }
 }
 
-/// Stable key for a `DeviceInfo` so we can diff between polls.
-/// Uses busnum + devnum on Linux (the camera's iSerial is empty, so
-/// `info.serial` isn't a useful key without opening the device).
-fn device_key(info: &DeviceInfo) -> String {
-    #[cfg(target_os = "linux")]
-    {
-        format!("{}:{}", info.busnum, info.devnum)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        format!(
-            "{:04x}:{:04x}:{}",
-            info.vendor_id, info.product_id, info.serial
-        )
-    }
-}
-
 #[cfg(target_os = "linux")]
 mod linux {
     use super::DeviceInfo;
-    use crate::devices::meet2;
     use crate::types::ProductType;
     use std::collections::HashMap;
 
@@ -259,12 +283,8 @@ mod linux {
             ) else {
                 continue;
             };
-            if vendor_id != meet2::VENDOR_ID {
+            let Some(product_type) = ProductType::from_usb_ids(vendor_id, product_id) else {
                 continue;
-            }
-            let product_type = match product_id {
-                meet2::PRODUCT_ID_MEET2 => ProductType::Meet2,
-                _ => continue,
             };
             let serial = std::fs::read_to_string(dev_dir.join("serial"))
                 .unwrap_or_default()
@@ -274,12 +294,21 @@ mod linux {
                 vendor_id,
                 product_id,
                 product_type,
+                product_name: read_string(&dev_dir.join("product")),
+                manufacturer: read_string(&dev_dir.join("manufacturer")),
                 serial,
                 busnum,
                 devnum,
             });
         }
         by_dev.into_values().collect()
+    }
+
+    fn read_string(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .trim()
+            .to_owned()
     }
 
     fn read_u8(path: &std::path::Path) -> crate::Result<u8> {
@@ -301,6 +330,62 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn camera(index: u8) -> DeviceInfo {
+        let mut info = crate::testing::meet2_mock_info();
+        info.serial.clear();
+        #[cfg(target_os = "macos")]
+        {
+            info.registry_id = u64::from(index);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            info.devnum = index;
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            info.serial = index.to_string();
+        }
+        info
+    }
+
+    #[test]
+    fn selection_requires_one_camera_or_a_matching_id() {
+        assert!(select_device(&[], None)
+            .unwrap_err()
+            .to_string()
+            .contains("no supported"));
+        let first = camera(1);
+        let second = camera(2);
+        assert_ne!(first.id(), second.id());
+        let cameras = [first.clone()];
+        assert_eq!(select_device(&cameras, None).unwrap().id(), first.id());
+        let cameras = [first, second];
+        assert!(select_device(&cameras, None)
+            .unwrap_err()
+            .to_string()
+            .contains("multiple"));
+        assert_eq!(
+            select_device(&cameras, Some(&cameras[1].id()))
+                .unwrap()
+                .id(),
+            cameras[1].id()
+        );
+        assert!(select_device(&cameras, Some("unknown"))
+            .unwrap_err()
+            .to_string()
+            .contains("unknown"));
+    }
+
+    #[test]
+    fn duplicate_interfaces_collapse_but_same_model_cameras_do_not() {
+        let first = camera(1);
+        let second = camera(2);
+        let devices = deduplicate(vec![second.clone(), first.clone(), first.clone()]);
+        assert_eq!(devices.len(), 2);
+        assert!(devices.iter().any(|d| d.id() == first.id()));
+        assert!(devices.iter().any(|d| d.id() == second.id()));
+    }
 
     #[test]
     fn list_does_not_panic_without_hardware() {

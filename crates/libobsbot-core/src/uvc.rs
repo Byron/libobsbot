@@ -67,4 +67,6 @@ pub(crate) enum UvcGet {
     Min = 0x82,
     /// `GET_MAX`. Upper bound of the supported range.
     Max = 0x83,
+    /// `GET_RES`. Smallest supported step.
+    Res = 0x84,
 }

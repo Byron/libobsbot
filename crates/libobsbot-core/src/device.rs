@@ -8,7 +8,7 @@
 
 use core::ops::RangeInclusive;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -23,6 +23,8 @@ use crate::types::{
 use crate::uvc::{self, UvcGet};
 use crate::{Error, Result};
 
+mod tiny3;
+
 /// Opened OBSBOT camera.
 ///
 /// Obtain via [`crate::Devices::open`]. Dropping the handle stops the
@@ -31,6 +33,7 @@ use crate::{Error, Result};
 pub struct Device {
     info: DeviceInfo,
     transport: Arc<dyn Transport>,
+    transaction: Mutex<()>,
     firmware: String,
     /// MAC tail used in the per-command sentinel bytes of XU RPC frames.
     /// Seeded with the originally captured value at construction; once
@@ -55,19 +58,26 @@ impl Device {
     ) -> Self {
         let cadence_ms = Arc::new(AtomicU32::new(Cadence::Slow.period_ms()));
         let poller_stop = Arc::new(AtomicBool::new(false));
-        let poller = events_tx.map(|tx| {
-            spawn_status_poller(
-                tx,
-                info.serial.clone(),
-                transport.clone(),
-                cadence_ms.clone(),
-                poller_stop.clone(),
-            )
-        });
+        let poller = events_tx
+            .filter(|_| info.product_type == ProductType::Meet2)
+            .map(|tx| {
+                spawn_status_poller(
+                    tx,
+                    info.serial.clone(),
+                    transport.clone(),
+                    cadence_ms.clone(),
+                    poller_stop.clone(),
+                )
+            });
+        let firmware = match info.product_type {
+            ProductType::Meet2 => meet2::MIN_FW.to_owned(),
+            ProductType::Tiny3 => String::new(),
+        };
         Self {
             info,
             transport,
-            firmware: meet2::MIN_FW.to_owned(),
+            transaction: Mutex::new(()),
+            firmware,
             mac,
             cadence_ms,
             poller_stop,
@@ -84,9 +94,7 @@ impl Device {
     /// Human-readable model name.
     #[must_use]
     pub fn name(&self) -> &str {
-        match self.info.product_type {
-            ProductType::Meet2 => "OBSBOT Meet 2",
-        }
+        self.info.product_type.name()
     }
 
     /// Device serial number as reported by the OS at enumeration time.
@@ -95,8 +103,8 @@ impl Device {
         &self.info.serial
     }
 
-    /// Firmware version string. Returns the build-time minimum until a real
-    /// camera response can be parsed.
+    /// Stored firmware version: the Meet 2 build-time minimum, or empty for
+    /// Tiny 3, whose firmware query has not been verified.
     #[must_use]
     pub fn firmware_version(&self) -> &str {
         &self.firmware
@@ -133,6 +141,11 @@ impl Device {
     /// recovered from `libdev.so`. Returns a dotted-decimal string
     /// like `"4.4.6.1"`.
     pub fn firmware_from_camera(&self) -> Result<String> {
+        if self.product_type() != ProductType::Meet2 {
+            return Err(Error::Unsupported(
+                "firmware query is only verified on Meet 2",
+            ));
+        }
         let mut tail = [0u8; 6];
         tail.copy_from_slice(&self.mac);
         let request = meet2::build_rpc_frame(0x01, 0x01, 0x0D, 0x08, 0x04, &[], 18, &tail);
@@ -153,6 +166,9 @@ impl Device {
 
     /// Ask the camera for its serial number via the XU RPC channel.
     pub fn serial_from_camera(&self) -> Result<String> {
+        if self.product_type() == ProductType::Tiny3 {
+            return self.tiny3_serial();
+        }
         let mut tail = [0u8; 8];
         tail[..6].copy_from_slice(&self.mac);
         tail[6] = 0x01;
@@ -170,6 +186,7 @@ impl Device {
         request: &[u8; meet2::RPC_FRAME_LEN],
         decode: impl Fn(&[u8]) -> Option<String>,
     ) -> Result<String> {
+        let _transaction = self.transaction.lock().expect("transaction mutex poisoned");
         self.transport
             .uvc_set(meet2::XU_ENTITY_ID, meet2::XU_SEL_RPC, request)?;
         let mut reply = [0u8; meet2::RPC_FRAME_LEN];
@@ -219,11 +236,8 @@ impl Device {
             .uvc_set(uvc::CAMERA_TERMINAL, uvc::ct::PANTILT_ABSOLUTE, &payload)
     }
 
-    /// Set zoom as a ratio of the camera's optical range (1.0 ..= max).
-    ///
-    /// Encodes as `CT_ZOOM_ABSOLUTE_CONTROL`: u16 LE objective focal length
-    /// (UVC 1.5 §4.2.2.1.10). Mapping is provisional until `GET_MIN`/`GET_MAX`
-    /// are queried.
+    /// Set raw UVC zoom units, retained for existing Rust and C callers.
+    /// Use [`Self::set_zoom_factor`] for Tiny 3 magnification factors.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn set_zoom(&self, zoom: f32) -> Result<()> {
         if !(0.0..=f32::from(u16::MAX)).contains(&zoom) {
@@ -270,16 +284,22 @@ impl Device {
         Ok((normalised_pantilt(pan), normalised_pantilt(tilt)))
     }
 
-    /// Read current zoom value. Returns the raw u16 as f32 until
-    /// `GET_MIN`/`GET_MAX` are wired up to give a meaningful ratio.
+    /// Read raw UVC zoom units as f32, retained for existing Rust and C callers.
+    /// Use [`Self::zoom_factor`] for Tiny 3 magnification factors.
     pub fn zoom(&self) -> Result<f32> {
         let mut buf = [0u8; 2];
-        let _ = self.transport.uvc_get(
+        let n = self.transport.uvc_get(
             UvcGet::Cur,
             uvc::CAMERA_TERMINAL,
             uvc::ct::ZOOM_ABSOLUTE,
             &mut buf,
         )?;
+        if n != buf.len() {
+            return Err(Error::BadResponse {
+                selector: uvc::ct::ZOOM_ABSOLUTE,
+                bytes: buf[..n.min(buf.len())].to_vec(),
+            });
+        }
         Ok(f32::from(u16::from_le_bytes(buf)))
     }
 
@@ -642,6 +662,15 @@ impl Device {
         Ok(lo..=hi)
     }
 
+    fn require_meet2(&self) -> Result<()> {
+        if self.product_type() != ProductType::Meet2 {
+            return Err(Error::Unsupported(
+                "this vendor control is only verified on Meet 2",
+            ));
+        }
+        Ok(())
+    }
+
     // ---- OBSBOT vendor extension (entity 2) ---------------------------------
     //
     // Every method below routes through the XU. Selector and payload layout
@@ -651,6 +680,7 @@ impl Device {
     /// `0x06` with the WDR control id; see `doc/protocol/meet2/setWdr.md`
     /// for the wire format.
     pub fn set_wdr(&self, mode: WdrMode) -> Result<()> {
+        self.require_meet2()?;
         let payload = meet2::mode_register_payload(meet2::MODE_WDR, &[encode_wdr(mode)]);
         self.transport
             .uvc_set(meet2::XU_ENTITY_ID, meet2::XU_SEL_MODE_REGISTER, &payload)
@@ -677,6 +707,9 @@ impl Device {
     /// recently selected mode, so `ai_mode()`, `auto_framing()`, and
     /// `media_mode()` all read it but interpret it differently.
     pub fn ai_mode(&self) -> Result<AiMode> {
+        if self.product_type() == ProductType::Tiny3 {
+            return self.tiny3_ai_mode();
+        }
         let blob = self.read_status_blob()?;
         decode_ai_mode(u16::from(blob[meet2::STATUS_AI_MODE_OFFSET]))
     }
@@ -687,6 +720,7 @@ impl Device {
     /// of individual fields are tracked under
     /// `meet2::STATUS_*_OFFSET`.
     fn read_status_blob(&self) -> Result<[u8; meet2::MODE_REGISTER_PAYLOAD_LEN]> {
+        self.require_meet2()?;
         let mut buf = [0u8; meet2::MODE_REGISTER_PAYLOAD_LEN];
         let _ = self.transport.uvc_get(
             UvcGet::Cur,
@@ -707,6 +741,7 @@ impl Device {
     /// [`meet2::MODE_FOV`](crate::devices) - see
     /// `doc/protocol/meet2/setFov.md`.
     pub fn set_fov(&self, fov: FovType) -> Result<()> {
+        self.require_meet2()?;
         let payload = meet2::mode_register_payload(meet2::MODE_FOV, &[encode_fov(fov)]);
         self.transport
             .uvc_set(meet2::XU_ENTITY_ID, meet2::XU_SEL_MODE_REGISTER, &payload)
@@ -715,6 +750,7 @@ impl Device {
     /// Toggle face-based auto-exposure. XU mode-register control id
     /// `0x03` - see `doc/protocol/meet2/setFaceAE.md`.
     pub fn set_face_ae(&self, on: bool) -> Result<()> {
+        self.require_meet2()?;
         let payload = meet2::mode_register_payload(meet2::MODE_FACE_AE, &[u8::from(on)]);
         self.transport
             .uvc_set(meet2::XU_ENTITY_ID, meet2::XU_SEL_MODE_REGISTER, &payload)
@@ -727,6 +763,8 @@ impl Device {
     /// runtime via `meet2::build_rpc_frame`; the CRCs at `[6,7]` and
     /// `[14,15]` are computed by the recovered CRC-16/USB routine.
     pub fn set_face_focus(&self, on: bool) -> Result<()> {
+        self.require_meet2()?;
+        let _transaction = self.transaction.lock().expect("transaction mutex poisoned");
         let payload = [u8::from(on), 0x00, 0x00, 0x00];
         let mut tail = [0u8; 8];
         tail[..6].copy_from_slice(&self.mac);
@@ -740,6 +778,7 @@ impl Device {
     /// Select media mode. XU mode-register control id `0x00` - see
     /// `doc/protocol/meet2/setMediaMode.md`.
     pub fn set_media_mode(&self, mode: MediaMode) -> Result<()> {
+        self.require_meet2()?;
         let payload =
             meet2::mode_register_payload(meet2::MODE_MEDIA_MODE, &[encode_media_mode(mode)]);
         self.transport
@@ -750,6 +789,7 @@ impl Device {
     /// `0x0d` with a 2-byte value `[group_single, close_upper]`; see
     /// `doc/protocol/meet2/setAutoFraming.md`.
     pub fn set_auto_framing(&self, mode: AutoFramingMode) -> Result<()> {
+        self.require_meet2()?;
         let payload =
             meet2::mode_register_payload(meet2::MODE_AUTO_FRAMING, &encode_auto_framing(mode));
         self.transport
@@ -759,6 +799,15 @@ impl Device {
     /// Set the AI master mode. XU mode-register control id `0x16`
     /// with a u16 LE value; see `doc/protocol/meet2/setAiMode.md`.
     pub fn set_ai_mode(&self, mode: AiMode) -> Result<()> {
+        if self.product_type() == ProductType::Tiny3 {
+            return match mode {
+                AiMode::None => self.set_tracking(false).map(|_| ()),
+                AiMode::Human => self.set_tracking(true).map(|_| ()),
+                _ => Err(Error::Unsupported(
+                    "Tiny 3 supports ordinary person tracking only",
+                )),
+            };
+        }
         let value: u16 = encode_ai_mode(mode);
         let payload = meet2::mode_register_payload(meet2::MODE_AI_MODE, &value.to_le_bytes());
         self.transport
@@ -771,6 +820,7 @@ impl Device {
     /// OBSBOT-proprietary control routed through the video XU rather
     /// than the audio surface.
     pub fn set_audio_agc(&self, on: bool) -> Result<()> {
+        self.require_meet2()?;
         let payload = meet2::mode_register_payload(meet2::MODE_AUDIO_AGC, &[u8::from(on)]);
         self.transport
             .uvc_set(meet2::XU_ENTITY_ID, meet2::XU_SEL_MODE_REGISTER, &payload)
@@ -779,6 +829,7 @@ impl Device {
     /// Flip the image horizontally (left/right mirror). XU
     /// mode-register control id `0x14`.
     pub fn set_flip_horizontal(&self, on: bool) -> Result<()> {
+        self.require_meet2()?;
         let payload = meet2::mode_register_payload(meet2::MODE_FLIP_HORIZONTAL, &[u8::from(on)]);
         self.transport
             .uvc_set(meet2::XU_ENTITY_ID, meet2::XU_SEL_MODE_REGISTER, &payload)
@@ -789,6 +840,7 @@ impl Device {
     /// this "vertical mode"; in portrait mode the camera rotates the
     /// pixel stream 90° so streaming apps see a tall frame natively.
     pub fn set_portrait(&self, on: bool) -> Result<()> {
+        self.require_meet2()?;
         let payload = meet2::mode_register_payload(meet2::MODE_VERTICAL, &[u8::from(on)]);
         self.transport
             .uvc_set(meet2::XU_ENTITY_ID, meet2::XU_SEL_MODE_REGISTER, &payload)
@@ -797,6 +849,7 @@ impl Device {
     /// Turn the camera's front-facing status LED on or off. XU
     /// mode-register control id `0x18`.
     pub fn set_led(&self, on: bool) -> Result<()> {
+        self.require_meet2()?;
         let payload = meet2::mode_register_payload(meet2::MODE_LED, &[u8::from(on)]);
         self.transport
             .uvc_set(meet2::XU_ENTITY_ID, meet2::XU_SEL_MODE_REGISTER, &payload)
@@ -806,6 +859,7 @@ impl Device {
     /// this returns the camera to a passthrough live image regardless
     /// of the current [`MediaBgMode`].
     pub fn set_bg_enable(&self, on: bool) -> Result<()> {
+        self.require_meet2()?;
         let payload = meet2::mode_register_payload(meet2::MODE_BG_ENABLE, &[u8::from(on)]);
         self.transport
             .uvc_set(meet2::XU_ENTITY_ID, meet2::XU_SEL_MODE_REGISTER, &payload)
@@ -815,6 +869,7 @@ impl Device {
     /// Setting this to anything other than [`MediaBgMode::Disable`]
     /// also requires [`set_bg_enable`](Self::set_bg_enable) to be on.
     pub fn set_bg_mode(&self, mode: MediaBgMode) -> Result<()> {
+        self.require_meet2()?;
         let byte: u8 = match mode {
             MediaBgMode::Disable => 0,
             MediaBgMode::Color => 1,
@@ -833,6 +888,7 @@ impl Device {
     /// to `i8`.
     #[allow(clippy::cast_sign_loss)]
     pub fn set_bg_color(&self, color: MediaBgColor) -> Result<()> {
+        self.require_meet2()?;
         let byte: i8 = match color {
             MediaBgColor::Disable => -2,
             MediaBgColor::Null => -1,
@@ -849,6 +905,7 @@ impl Device {
 
     /// Set the background-blur intensity, 0 (no blur) to 100 (max).
     pub fn set_mask_level(&self, level: u8) -> Result<()> {
+        self.require_meet2()?;
         if level > 100 {
             return Err(Error::OutOfRange);
         }
@@ -860,6 +917,7 @@ impl Device {
     /// Control whether the camera is allowed to auto-suspend when no
     /// host application is streaming from it. `true` keeps it awake.
     pub fn set_disable_sleep_without_stream(&self, disable: bool) -> Result<()> {
+        self.require_meet2()?;
         let payload = meet2::mode_register_payload(
             meet2::MODE_DISABLE_SLEEP_WITHOUT_STREAM,
             &[u8::from(disable)],
@@ -871,6 +929,7 @@ impl Device {
     /// Set the auto-suspend timer, in minutes. `0` keeps the camera
     /// awake indefinitely (subject to host-side power management).
     pub fn set_suspend_time(&self, minutes: u16) -> Result<()> {
+        self.require_meet2()?;
         let payload =
             meet2::mode_register_payload(meet2::MODE_SUSPEND_TIME, &minutes.to_le_bytes());
         self.transport
@@ -880,6 +939,7 @@ impl Device {
     /// Whether the microphone stays hot while the camera is asleep.
     /// Maps to the SDK's `cameraSetMicrophoneDuringSleepU`.
     pub fn set_microphone_during_sleep(&self, on: bool) -> Result<()> {
+        self.require_meet2()?;
         let payload = meet2::mode_register_payload(meet2::MODE_MIC_DURING_SLEEP, &[u8::from(on)]);
         self.transport
             .uvc_set(meet2::XU_ENTITY_ID, meet2::XU_SEL_MODE_REGISTER, &payload)
@@ -890,6 +950,7 @@ impl Device {
     /// is sent as-is so callers can pick the encoding the device
     /// firmware uses.
     pub fn set_button_mode(&self, mode: u8) -> Result<()> {
+        self.require_meet2()?;
         let payload = meet2::mode_register_payload(meet2::MODE_BUTTON_MODE, &[mode]);
         self.transport
             .uvc_set(meet2::XU_ENTITY_ID, meet2::XU_SEL_MODE_REGISTER, &payload)

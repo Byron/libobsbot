@@ -85,6 +85,8 @@ pub(crate) fn meet2_mock_info() -> DeviceInfo {
         vendor_id: meet2::VENDOR_ID,
         product_id: meet2::PRODUCT_ID_MEET2,
         product_type: ProductType::Meet2,
+        product_name: "OBSBOT Meet 2".to_owned(),
+        manufacturer: "OBSBOT".to_owned(),
         serial: "MOCK".to_owned(),
         #[cfg(target_os = "linux")]
         busnum: 0,
@@ -102,6 +104,7 @@ pub(crate) fn meet2_mock_info() -> DeviceInfo {
 /// differ.
 pub(crate) struct ScriptedTransport {
     responses: Mutex<Vec<Vec<u8>>>,
+    pub sets: Mutex<Vec<(u8, u8, Vec<u8>)>>,
 }
 
 impl ScriptedTransport {
@@ -111,12 +114,17 @@ impl ScriptedTransport {
         responses.reverse(); // Vec::pop pulls from the end.
         Self {
             responses: Mutex::new(responses),
+            sets: Mutex::new(Vec::new()),
         }
     }
 }
 
 impl Transport for ScriptedTransport {
-    fn uvc_set(&self, _entity: u8, _selector: u8, _payload: &[u8]) -> Result<()> {
+    fn uvc_set(&self, entity: u8, selector: u8, payload: &[u8]) -> Result<()> {
+        self.sets
+            .lock()
+            .unwrap()
+            .push((entity, selector, payload.to_vec()));
         Ok(())
     }
 

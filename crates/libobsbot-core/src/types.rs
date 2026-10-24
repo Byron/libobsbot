@@ -5,8 +5,32 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ProductType {
-    /// OBSBOT Meet 2 - the only model supported in v1.
+    /// OBSBOT Meet 2.
     Meet2,
+    /// OBSBOT Tiny 3 (full model, not Tiny 3 Lite).
+    Tiny3,
+}
+
+impl ProductType {
+    /// Human-readable camera model.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Meet2 => "OBSBOT Meet 2",
+            Self::Tiny3 => "OBSBOT Tiny 3",
+        }
+    }
+
+    pub(crate) const fn from_usb_ids(vendor: u16, product: u16) -> Option<Self> {
+        match (vendor, product) {
+            (crate::devices::meet2::VENDOR_ID, crate::devices::meet2::PRODUCT_ID_MEET2) => {
+                Some(Self::Meet2)
+            }
+            // Full Tiny 3 USB descriptors: doc/protocol/tiny3/README.md.
+            (0x3564, 0xff02) => Some(Self::Tiny3),
+            _ => None,
+        }
+    }
 }
 
 /// Field-of-view preset.
@@ -69,7 +93,24 @@ impl core::fmt::Display for FirmwareVersion {
 
 #[cfg(test)]
 mod tests {
-    use super::FirmwareVersion;
+    use super::{FirmwareVersion, ProductType};
+
+    #[test]
+    fn usb_ids_distinguish_tiny3_from_unverified_models() {
+        assert_eq!(
+            ProductType::from_usb_ids(0x3564, 0xff02),
+            Some(ProductType::Tiny3)
+        );
+        assert_eq!(ProductType::from_usb_ids(0x3564, 0xff03), None);
+        assert_eq!(ProductType::from_usb_ids(0x1234, 0xff02), None);
+        assert_eq!(
+            ProductType::from_usb_ids(
+                crate::devices::meet2::VENDOR_ID,
+                crate::devices::meet2::PRODUCT_ID_MEET2
+            ),
+            Some(ProductType::Meet2)
+        );
+    }
 
     #[test]
     fn firmware_version_parses_dotted_decimals() {

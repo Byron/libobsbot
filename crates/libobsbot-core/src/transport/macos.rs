@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! macOS USB transport via `IOKit`.
 //!
-//! Talks to the OBSBOT camera through `IOUSBDeviceInterface::DeviceRequest`
+//! Talks to the OBSBOT camera through `IOUSBDeviceInterface182::DeviceRequestTO`
 //! on the device's default control pipe (endpoint 0). Class-specific
 //! UVC transfers - `SET_CUR` / `GET_*` on a `(entity, selector)` pair -
 //! are routed by `wIndex = (entity << 8) | interface_number` and do
@@ -14,7 +14,7 @@
 //! `VideoControl` interface. `IOUSBInterfaceInterface::ControlRequest`
 //! would have to fight `UVCAssistant` for that claim - and lose, even
 //! through `USBInterfaceOpenSeize`, because `UVCAssistant` refuses to
-//! yield. Device-level `DeviceRequest` sidesteps the conflict.
+//! yield. Device-level `DeviceRequestTO` sidesteps the conflict.
 //!
 //! Streaming would still need the interface, but this SDK only does
 //! control transfers; we never claim a pipe.
@@ -46,15 +46,15 @@ use crate::{Error, Result};
 
 // ---- IOKit USB inline FFI -------------------------------------------------
 //
-// Apple deprecated the user-space `IOUSBLib.h` struct definitions in
-// modern SDKs and now ships only the UUID `#define`s. The COM-style
-// vtable ABI is still stable for runtime use; we declare just the
-// methods we need, with every preceding vtable slot present so the
-// field offsets match Apple's binary contract.
+// These declarations match Apple's USB.h and IOUSBLib.h. Every vtable
+// slot preceding DeviceRequestTO is present to preserve the COM ABI.
 
 /// `kIOReturnSuccess` from `IOReturn.h`.
 const KERN_SUCCESS: i32 = 0;
 const KIO_RETURN_EXCLUSIVE_ACCESS: i32 = -0x1fff_fd3b; // 0xe000_02c5
+const KIO_RETURN_TIMEOUT: i32 = -0x1fff_fd2a; // 0xe000_02d6
+const KIO_USB_TRANSACTION_TIMEOUT: i32 = -0x1fff_bfaf; // 0xe000_4051
+const CONTROL_TIMEOUT_MS: u32 = 1000;
 
 /// Sentinel for "don't filter on this field" in `IOUSBFindInterfaceRequest`.
 const KUSB_FIND_INTERFACE_DONT_CARE: u16 = 0xffff;
@@ -75,6 +75,19 @@ struct IOUSBDevRequest {
 }
 
 #[repr(C)]
+struct IOUSBDevRequestTO {
+    bm_request_type: u8,
+    b_request: u8,
+    w_value: u16,
+    w_index: u16,
+    w_length: u16,
+    p_data: *mut c_void,
+    w_len_done: u32,
+    no_data_timeout: u32,
+    completion_timeout: u32,
+}
+
+#[repr(C)]
 #[allow(clippy::struct_field_names)]
 struct IOUSBFindInterfaceRequest {
     b_interface_class: u16,
@@ -83,13 +96,10 @@ struct IOUSBFindInterfaceRequest {
     b_alternate_setting: u16,
 }
 
-/// `IOUSBDeviceInterface` v100 vtable. Declares enough slots to reach
-/// `CreateInterfaceIterator`; later versions append after this and
-/// `QueryInterface` would give us a fatter struct, but the prefix is
-/// ABI-stable.
+/// Prefix of Apple's `IOUSBDeviceInterface182` through `DeviceRequestTO`.
 #[repr(C)]
 #[allow(dead_code)] // The unused vtable slots are real ABI we just don't call.
-struct IOUSBDeviceInterface {
+struct IOUSBDeviceInterface182 {
     _reserved: *mut c_void,
     query_interface: unsafe extern "C" fn(*mut c_void, CFUUIDBytes, *mut *mut c_void) -> i32,
     add_ref: unsafe extern "C" fn(*mut c_void) -> u32,
@@ -117,7 +127,7 @@ struct IOUSBDeviceInterface {
     _set_configuration: unsafe extern "C" fn(*mut c_void, u8) -> i32,
     _get_bus_frame_number: unsafe extern "C" fn(*mut c_void, *mut u64, *mut u64) -> i32,
     _reset_device: unsafe extern "C" fn(*mut c_void) -> i32,
-    device_request: unsafe extern "C" fn(*mut c_void, *mut IOUSBDevRequest) -> i32,
+    _device_request: unsafe extern "C" fn(*mut c_void, *mut IOUSBDevRequest) -> i32,
     _device_request_async:
         unsafe extern "C" fn(*mut c_void, *mut IOUSBDevRequest, *mut c_void, *mut c_void) -> i32,
     create_interface_iterator: unsafe extern "C" fn(
@@ -125,6 +135,8 @@ struct IOUSBDeviceInterface {
         *mut IOUSBFindInterfaceRequest,
         *mut io_iterator_t,
     ) -> i32,
+    _usb_device_open_seize: unsafe extern "C" fn(*mut c_void) -> i32,
+    device_request_to: unsafe extern "C" fn(*mut c_void, *mut IOUSBDevRequestTO) -> i32,
 }
 
 /// `IOCFPlugInInterface` vtable (we only need it to call
@@ -207,41 +219,38 @@ fn k_iocf_plugin_interface_id() -> CFUUIDRef {
     }
 }
 
-/// `kIOUSBDeviceInterfaceID` (5c8187d0-9ef3-11d4-8b45-000a27052861).
-/// The v100 interface; every later version is a superset, so a fatter
-/// vtable returned at runtime is fine - we never touch the slots past
-/// v100.
+/// `kIOUSBDeviceInterfaceID182` (152fc496-4891-11d5-9d52-000a27801e86).
 fn k_iousb_device_interface_id() -> CFUUIDRef {
     // SAFETY: see `k_iousb_device_user_client_type_id`.
     unsafe {
         CFUUIDGetConstantUUIDWithBytes(
             std::ptr::null(),
-            0x5c,
-            0x81,
-            0x87,
-            0xd0,
-            0x9e,
-            0xf3,
+            0x15,
+            0x2f,
+            0xc4,
+            0x96,
+            0x48,
+            0x91,
             0x11,
-            0xd4,
-            0x8b,
-            0x45,
+            0xd5,
+            0x9d,
+            0x52,
             0x00,
             0x0a,
             0x27,
-            0x05,
-            0x28,
-            0x61,
+            0x80,
+            0x1e,
+            0x86,
         )
     }
 }
 
 // ---- Transport ------------------------------------------------------------
 
-/// `IOKit`-backed transport. Owns the `IOUSBDeviceInterface` for the
+/// `IOKit`-backed transport. Owns the `IOUSBDeviceInterface182` for the
 /// camera and the resolved `VideoControl` interface number.
 ///
-/// The interface pointer is a COM-style `(IOUSBDeviceInterface **)`.
+/// The interface pointer is a COM-style `(IOUSBDeviceInterface182 **)`.
 /// Apple's docs state that calls on it are thread-safe; the Rust type
 /// system can't see that, so we wrap it in a `Mutex` for an
 /// unambiguous Send + Sync contract. Our access pattern (one short
@@ -252,8 +261,8 @@ pub struct MacosTransport {
 }
 
 struct TransportInner {
-    /// `IOUSBDeviceInterface **` returned by `QueryInterface`.
-    dev: *mut *mut IOUSBDeviceInterface,
+    /// `IOUSBDeviceInterface182 **` returned by `QueryInterface`.
+    dev: *mut *mut IOUSBDeviceInterface182,
     /// `bInterfaceNumber` of the `VideoControl` interface. Encoded
     /// into `wIndex` on every control transfer (UVC class-specific
     /// requests are addressed by interface number, not by entity id).
@@ -276,10 +285,10 @@ impl Drop for TransportInner {
 
 impl MacosTransport {
     /// Open the OBSBOT camera identified by `info`. Re-finds the device
-    /// in `IOKit` via its registry id, builds an `IOUSBDeviceInterface`,
+    /// in `IOKit` via its registry id, builds an `IOUSBDeviceInterface182`,
     /// and resolves the `VideoControl` interface number for later
     /// control transfers. Does NOT call `USBDeviceOpen`: class-specific
-    /// `DeviceRequest`s don't require an exclusive device claim and we
+    /// `DeviceRequestTO`s don't require an exclusive device claim and we
     /// don't want to fight `UVCAssistant`.
     pub fn open(info: &crate::discovery::DeviceInfo) -> Result<Self> {
         let device_service = lookup_service_by_registry_id(info.registry_id)?;
@@ -334,11 +343,7 @@ impl super::Transport for MacosTransport {
             inner.interface_number,
             &mut buf,
         )?;
-        let kr = device_request(inner.dev, &mut req)?;
-        if kr != KERN_SUCCESS {
-            return Err(io_return_error("DeviceRequest SET_CUR", kr));
-        }
-        Ok(())
+        device_request(inner.dev, &mut req).map(|_| ())
     }
 
     fn uvc_get(&self, req: UvcGet, entity: u8, selector: u8, out: &mut [u8]) -> Result<usize> {
@@ -358,11 +363,7 @@ impl super::Transport for MacosTransport {
             inner.interface_number,
             out,
         )?;
-        let kr = device_request(inner.dev, &mut dev_req)?;
-        if kr != KERN_SUCCESS {
-            return Err(io_return_error("DeviceRequest GET_*", kr));
-        }
-        Ok(usize::try_from(dev_req.w_len_done).unwrap_or(out.len()))
+        device_request(inner.dev, &mut dev_req)
     }
 }
 
@@ -372,7 +373,7 @@ enum UvcRequestDirection {
     DeviceToHost,
 }
 
-/// Build a UVC class-specific `IOUSBDevRequest` targeting
+/// Build a UVC class-specific `IOUSBDevRequestTO` targeting
 /// `(entity, selector)` on the given `interface_number`. Returns an
 /// error if `data` doesn't fit in `wLength`.
 fn build_request(
@@ -382,7 +383,7 @@ fn build_request(
     selector: u8,
     interface_number: u8,
     data: &mut [u8],
-) -> Result<IOUSBDevRequest> {
+) -> Result<IOUSBDevRequestTO> {
     let length = u16::try_from(data.len()).map_err(|_| {
         Error::Usb(format!(
             "macos: control transfer length {} exceeds u16::MAX",
@@ -394,7 +395,7 @@ fn build_request(
         UvcRequestDirection::HostToDevice => 0x21,
         UvcRequestDirection::DeviceToHost => 0xa1,
     };
-    Ok(IOUSBDevRequest {
+    Ok(IOUSBDevRequestTO {
         bm_request_type,
         b_request,
         w_value: u16::from(selector) << 8,
@@ -402,22 +403,49 @@ fn build_request(
         w_length: length,
         p_data: data.as_mut_ptr().cast(),
         w_len_done: 0,
+        no_data_timeout: CONTROL_TIMEOUT_MS,
+        completion_timeout: CONTROL_TIMEOUT_MS,
     })
 }
 
 /// Issue a single control request via the device interface vtable.
-fn device_request(dev: *mut *mut IOUSBDeviceInterface, req: &mut IOUSBDevRequest) -> Result<i32> {
+fn device_request(
+    dev: *mut *mut IOUSBDeviceInterface182,
+    req: &mut IOUSBDevRequestTO,
+) -> Result<usize> {
     if dev.is_null() {
         return Err(Error::Usb("macos: device interface pointer is null".into()));
     }
-    // SAFETY: `dev` is a live `IOUSBDeviceInterface **` we obtained in
+    // SAFETY: `dev` is a live `IOUSBDeviceInterface182 **` we obtained in
     // `MacosTransport::open` and have not released yet; the request
     // struct is fully initialised.
-    let kr = unsafe { ((**dev).device_request)(dev.cast(), req) };
-    Ok(kr)
+    let kr = unsafe { ((**dev).device_request_to)(dev.cast(), req) };
+    if kr != KERN_SUCCESS {
+        return Err(io_return_error("DeviceRequestTO", kr));
+    }
+    transferred_length(req)
+}
+
+fn transferred_length(req: &IOUSBDevRequestTO) -> Result<usize> {
+    if req.w_len_done > u32::from(req.w_length) {
+        return Err(Error::Usb(format!(
+            "macos: control transfer returned {} bytes for a {}-byte buffer",
+            req.w_len_done, req.w_length
+        )));
+    }
+    if req.bm_request_type & 0x80 == 0 && req.w_len_done != u32::from(req.w_length) {
+        return Err(Error::Usb(format!(
+            "macos: short control write: transferred {} of {} bytes",
+            req.w_len_done, req.w_length
+        )));
+    }
+    Ok(usize::try_from(req.w_len_done).expect("a u16 transfer length fits in usize"))
 }
 
 fn io_return_error(stage: &str, kr: i32) -> Error {
+    if matches!(kr, KIO_RETURN_TIMEOUT | KIO_USB_TRANSACTION_TIMEOUT) {
+        return Error::Timeout;
+    }
     let detail = if kr == KIO_RETURN_EXCLUSIVE_ACCESS {
         "kIOReturnExclusiveAccess - another app (FaceTime / Zoom / OBS / Cheese) is using the camera in a way that blocks raw USB control"
     } else {
@@ -448,7 +476,7 @@ fn lookup_service_by_registry_id(registry_id: u64) -> Result<io_service_t> {
 /// Walk the device's interfaces looking for `(class=Video,
 /// subclass=VideoControl)` and read its `bInterfaceNumber` directly
 /// from the registry entry - no `USBInterfaceOpen` required.
-fn find_video_control_interface_number(dev: *mut *mut IOUSBDeviceInterface) -> Result<u8> {
+fn find_video_control_interface_number(dev: *mut *mut IOUSBDeviceInterface182) -> Result<u8> {
     let mut filter = IOUSBFindInterfaceRequest {
         b_interface_class: UVC_INTERFACE_CLASS_VIDEO,
         b_interface_sub_class: UVC_INTERFACE_SUBCLASS_VIDEO_CONTROL,
@@ -489,8 +517,8 @@ fn find_video_control_interface_number(dev: *mut *mut IOUSBDeviceInterface) -> R
 }
 
 /// `IOCreatePlugInInterfaceForService` + `QueryInterface` to produce an
-/// `IOUSBDeviceInterface **`.
-fn create_device_interface(service: io_service_t) -> Result<*mut *mut IOUSBDeviceInterface> {
+/// `IOUSBDeviceInterface182 **`.
+fn create_device_interface(service: io_service_t) -> Result<*mut *mut IOUSBDeviceInterface182> {
     let mut plugin: *mut *mut IOCFPlugInInterface = std::ptr::null_mut();
     let mut score: i32 = 0;
     // SAFETY: `service` is a live io_service_t; the UUIDs are static
@@ -524,13 +552,13 @@ fn create_device_interface(service: io_service_t) -> Result<*mut *mut IOUSBDevic
     }
     if qkr != KERN_SUCCESS || iface.is_null() {
         return Err(Error::Usb(format!(
-            "macos: QueryInterface(IOUSBDeviceInterface) returned HRESULT {qkr:#010x}"
+            "macos: QueryInterface(IOUSBDeviceInterface182) returned HRESULT {qkr:#010x}"
         )));
     }
-    Ok(iface.cast::<*mut IOUSBDeviceInterface>())
+    Ok(iface.cast::<*mut IOUSBDeviceInterface182>())
 }
 
-/// SAFETY: The `IOUSBDeviceInterface` is Apple-documented as safe to
+/// SAFETY: The `IOUSBDeviceInterface182` is Apple-documented as safe to
 /// call from any thread. We wrap it in a `Mutex` in `MacosTransport`
 /// for an unambiguous contract.
 unsafe impl Send for TransportInner {}
@@ -696,5 +724,92 @@ fn registry_entry_id(entry: io_registry_entry_t) -> Option<u64> {
         Some(id)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_layout_matches_apple_usb_headers() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(size_of::<IOUSBDevRequestTO>(), 32);
+        assert_eq!(offset_of!(IOUSBDevRequestTO, p_data), 8);
+        assert_eq!(offset_of!(IOUSBDevRequestTO, w_len_done), 16);
+        assert_eq!(offset_of!(IOUSBDevRequestTO, no_data_timeout), 20);
+        assert_eq!(offset_of!(IOUSBDevRequestTO, completion_timeout), 24);
+        assert_eq!(
+            offset_of!(IOUSBDeviceInterface182, create_interface_iterator),
+            28 * size_of::<*mut c_void>()
+        );
+        assert_eq!(
+            offset_of!(IOUSBDeviceInterface182, device_request_to),
+            30 * size_of::<*mut c_void>()
+        );
+    }
+
+    #[test]
+    fn request_encodes_interface_and_bounded_timeouts() {
+        let mut buf = [0; 60];
+        let req = build_request(UvcRequestDirection::HostToDevice, 1, 3, 2, 7, &mut buf).unwrap();
+        assert_eq!(req.bm_request_type, 0x21);
+        assert_eq!(req.b_request, 1);
+        assert_eq!(req.w_value, 0x0200);
+        assert_eq!(req.w_index, 0x0307);
+        assert_eq!(req.w_length, 60);
+        assert_eq!(req.p_data, buf.as_mut_ptr().cast());
+        assert_eq!(req.no_data_timeout, 1000);
+        assert_eq!(req.completion_timeout, 1000);
+        assert!(build_request(
+            UvcRequestDirection::HostToDevice,
+            1,
+            3,
+            2,
+            7,
+            &mut vec![0; usize::from(u16::MAX) + 1]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn get_reports_short_reads_and_rejects_impossible_lengths() {
+        let mut buf = [0; 60];
+        let mut req = build_request(
+            UvcRequestDirection::DeviceToHost,
+            UvcGet::Cur as u8,
+            3,
+            2,
+            0,
+            &mut buf,
+        )
+        .unwrap();
+        assert_eq!(req.bm_request_type, 0xa1);
+        req.w_len_done = 2;
+        assert_eq!(transferred_length(&req).unwrap(), 2);
+        req.w_len_done = 61;
+        assert!(transferred_length(&req).is_err());
+    }
+
+    #[test]
+    fn set_rejects_short_writes() {
+        let mut buf = [0; 2];
+        let mut req =
+            build_request(UvcRequestDirection::HostToDevice, 1, 1, 0x0b, 0, &mut buf).unwrap();
+        req.w_len_done = 1;
+        assert!(transferred_length(&req).is_err());
+        req.w_len_done = 2;
+        assert_eq!(transferred_length(&req).unwrap(), 2);
+    }
+
+    #[test]
+    fn reports_control_timeouts() {
+        for kr in [KIO_RETURN_TIMEOUT, KIO_USB_TRANSACTION_TIMEOUT] {
+            assert!(matches!(
+                io_return_error("DeviceRequestTO", kr),
+                Error::Timeout
+            ));
+        }
     }
 }

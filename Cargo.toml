@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/libobsbot-core", "crates/libobsbot-ffi"]
+members = ["crates/libobsbot-core", "crates/libobsbot-ffi", "crates/obsbot"]
 
 [workspace.package]
 version = "0.0.0"

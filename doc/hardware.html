@@ -50,6 +50,20 @@ own software talks to it.</p>
 
 <h2>Supported</h2>
 
+<h3>OBSBOT Tiny 3 (full model)</h3>
+
+<p>USB <code>3564:ff02</code>, product descriptor <code>OBSBOT Tiny 3</code>.
+The <code>obsbot</code> CLI provides device enumeration, person-tracking
+toggle/on/off, and zoom factor read/write through the existing macOS USB/UVC
+transport. Tracking and zoom commands require camera-state readback before
+reporting success. Tiny 3 Lite is not included.</p>
+
+<p>See the
+<a href="https://github.com/ananthb/libobsbot/blob/main/doc/protocol/tiny3/README.md">Tiny 3 protocol and hardware notes</a>
+for public reference sources, descriptor evidence, factor conversion, and
+hardware validation results. This model uses public protocol facts and direct
+tests of the connected camera; it does not require OBSBOT Center captures.</p>
+
 <h3>OBSBOT Meet 2 - <span class="ok">in progress</span></h3>
 
 <p>USB <code>3564:fefb</code>, <code>bcdDevice = 5.10</code>, XU GUID

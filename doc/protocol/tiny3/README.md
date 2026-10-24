@@ -126,6 +126,32 @@ At this follow-up's start, the full camera's selector-6 status byte **6** was
 readback using the Lite's interpretation; HDR toggling and image comparisons
 have not been verified on the full Tiny 3. The HDR setting was left unchanged.
 
+Release CLI checks in separate invocations:
+
+```text
+obsbot wake                              → awake
+obsbot standby                           → standby
+obsbot --device usb-1001ad64c wake        → awake
+obsbot --device usb-1001ad64c standby     → standby
+obsbot standby                           → standby (already asleep)
+obsbot zoom 1.5                          → zoom 1.51×
+obsbot zoom 1                            → zoom 1×
+obsbot standby                           → standby (restored)
+```
+
+**Newly observed limitation:** after standby/wake, `track on` was ignored in
+this follow-up, including with five extra seconds of wake settling. Independent
+readback remained category 0 and the CLI correctly returned a nonzero timeout.
+No active video stream was confirmed in this test; whether a stream is required
+after standby is not established. The earlier tracking/reframing tests below
+passed. A temporary AVFoundation observation received no frames, so physical
+parking and live-video behavior during standby were not independently checked.
+
+Follow-up validation: formatting, workspace tests (76 core, 5 FFI, 4 CLI and
+1 existing integration test), strict workspace/all-targets Clippy, and the
+release CLI build passed. The C ABI is unchanged. Final independent status
+confirmed standby, tracking off, native zoom 0, HDR flag 1, and idle timer 120.
+
 ## Zoom calibration and firmware settling
 
 Observed direct requests: **GET_MIN=0, GET_MAX=100, GET_RES=1**.

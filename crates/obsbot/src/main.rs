@@ -15,6 +15,8 @@ Commands:
   track on|off     Enable or disable ordinary person tracking
   zoom             Read the current zoom factor
   zoom <FACTOR>    Set magnification (for example, 1.5 for 1.5×)
+  standby          Put the camera in standby
+  wake             Wake the camera and allow startup to settle
 
 Options:
   --device <ID>    Select an ID printed by `obsbot devices`
@@ -22,7 +24,7 @@ Options:
 
 One connected camera is selected automatically. With multiple cameras,
 --device is required. Device IDs can change when a camera is reconnected.
-Tracking and zoom commands print the camera's confirmed resulting state.
+Control commands print the camera's confirmed resulting state.
 ";
 
 #[derive(Debug, PartialEq)]
@@ -37,6 +39,7 @@ enum Command {
     Devices,
     Track(Option<bool>),
     Zoom(Option<f64>),
+    Standby(bool),
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -76,6 +79,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             _ => return Err("tracking state must be `on` or `off`".into()),
         },
         [command] if command == "zoom" => Command::Zoom(None),
+        [command] if command == "standby" => Command::Standby(true),
+        [command] if command == "wake" => Command::Standby(false),
         [command, factor] if command == "zoom" => {
             let factor = factor
                 .parse::<f64>()
@@ -84,7 +89,12 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 .ok_or("zoom factor must be a finite positive number (for example, 1.5)")?;
             Command::Zoom(Some(factor))
         }
-        [command, ..] if matches!(command.as_str(), "devices" | "track" | "zoom") => {
+        [command, ..]
+            if matches!(
+                command.as_str(),
+                "devices" | "track" | "zoom" | "standby" | "wake"
+            ) =>
+        {
             return Err(format!(
                 "too many arguments for {command}; see `obsbot --help`"
             ));
@@ -139,7 +149,7 @@ fn run(args: &Args) -> Result<(), String> {
     })?;
     if info.product_type != ProductType::Tiny3 {
         return Err(format!(
-            "tracking and zoom factor control are supported for Tiny 3; selected {}",
+            "CLI controls are supported for Tiny 3; selected {}",
             info.product_type.name()
         ));
     }
@@ -175,6 +185,16 @@ fn run(args: &Args) -> Result<(), String> {
             })?;
             println!("zoom {achieved}×");
         }
+        Command::Standby(standby) => {
+            let state = device.set_standby(standby).map_err(|err| match err {
+                Error::Timeout => format!(
+                    "camera did not confirm {} before timeout",
+                    if standby { "standby" } else { "wake" }
+                ),
+                _ => err.to_string(),
+            })?;
+            println!("{}", if state { "standby" } else { "awake" });
+        }
         Command::Help | Command::Devices => unreachable!("handled before opening a camera"),
     }
     Ok(())
@@ -207,6 +227,8 @@ mod tests {
             (vec!["track", "off"], Command::Track(Some(false))),
             (vec!["zoom"], Command::Zoom(None)),
             (vec!["zoom", "1.5"], Command::Zoom(Some(1.5))),
+            (vec!["standby"], Command::Standby(true)),
+            (vec!["wake"], Command::Standby(false)),
         ] {
             assert_eq!(parse(&args).unwrap().command, command);
         }
@@ -226,6 +248,15 @@ mod tests {
             parse(&["--device", "usb-123", "track"]).unwrap().command,
             Command::Track(None)
         );
+        for (command, standby) in [("standby", true), ("wake", false)] {
+            assert_eq!(
+                parse(&["--device", "usb-123", command]).unwrap(),
+                Args {
+                    device: Some("usb-123".into()),
+                    command: Command::Standby(standby),
+                }
+            );
+        }
     }
 
     #[test]
@@ -249,6 +280,8 @@ mod tests {
             vec!["track", "on", "off"],
             vec!["zoom", "1", "2"],
             vec!["devices", "extra"],
+            vec!["standby", "extra"],
+            vec!["wake", "extra"],
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
         }

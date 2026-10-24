@@ -45,8 +45,11 @@ obsbot track on
 obsbot track off
 obsbot zoom
 obsbot zoom 1.5
+obsbot standby
+obsbot wake
 obsbot --device usb-1001ad64c track
 obsbot --device usb-1001ad64c zoom 1.5
+obsbot --device usb-1001ad64c standby
 ```
 
 Replace `usb-1001ad64c` with an ID printed by `obsbot devices`. IDs identify
@@ -54,8 +57,8 @@ physical cameras, deduplicating USB interfaces, and remain valid across
 CLI invocations while the camera is connected. Reconnecting can change an ID.
 With one supported camera selection is automatic; multiple cameras require
 `--device`. Control commands fail if no camera is found. Meet 2 cameras remain
-available through the library and appear in `devices`, but the CLI's tracking
-and zoom factor controls currently require Tiny 3.
+available through the library and appear in `devices`, but the CLI's tracking,
+zoom factor, and standby controls currently require Tiny 3.
 
 `track` reads the actual person-tracking state before toggling it; `track on`
 and `track off` set it explicitly. Successful commands print the confirmed
@@ -71,6 +74,13 @@ A request for `1.5` normally produces `1.51×`. Tested firmware can settle up to
 and fails if the result cannot be confirmed. Control writes wake a sleeping
 camera; queries leave it asleep. See the protocol record for measurements and
 limits. Tiny 3 control is currently enabled on macOS only.
+
+`standby` puts the camera to sleep and prints `standby` after status confirmation.
+`wake` prints `awake` after confirmation and a two-second startup delay. Both
+are safe to repeat. Starting a video stream can wake the camera again; standby
+does not disable USB or establish that its microphone is muted.
+Tracking-on was ignored in follow-up testing after standby/wake without a
+confirmed video stream; the CLI reports a timeout. See the protocol notes.
 
 > **Have an OBSBOT camera we don't yet support?** The fastest way to
 > add it is a USB packet capture. See the

@@ -48,9 +48,10 @@ pub(crate) fn build_serial_request(seq: u16) -> [u8; FRAME_LEN] {
     build_header(0x01, seq, 0x0d, SERIAL_COMMAND)
 }
 
-pub(crate) fn build_wake_request(seq: u16) -> [u8; FRAME_LEN] {
+pub(crate) fn build_power_request(seq: u16, standby: bool) -> [u8; FRAME_LEN] {
     let mut frame = build_header(0x25, seq, 0x02, 0xa0c2);
     frame[12] = 4;
+    frame[16] = u8::from(standby);
     let crc = crc16_usb(&frame[12..20]);
     frame[14..16].copy_from_slice(&crc.to_le_bytes());
     frame
@@ -139,10 +140,14 @@ mod tests {
     }
 
     #[test]
-    fn wake_request_matches_public_capture() {
+    fn power_requests_match_public_protocol_vectors() {
         assert_eq!(
-            build_wake_request(0x00a5),
+            build_power_request(0x00a5, false),
             hex_frame("aa25a5000c005fef0a02c2a00400be0700000000")
+        );
+        assert_eq!(
+            build_power_request(0x0042, true),
+            hex_frame("aa2542000c00ea630a02c2a00400bffb01000000")
         );
     }
 

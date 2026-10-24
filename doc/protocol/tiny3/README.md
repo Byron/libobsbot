@@ -2,7 +2,7 @@
 
 Implemented and tested on macOS on 2026-10-24. This is the **full Tiny 3**,
 not the Lite. Only enumeration, runtime serial, ordinary person tracking,
-wake-before-control, and calibrated zoom are supported. No OBSBOT Center,
+standby/wake, and calibrated zoom are supported. No OBSBOT Center,
 vendor SDK, or background service was used. The CLI uses libobsbot-core's
 existing macOS USB/UVC transport.
 
@@ -17,7 +17,7 @@ Read and used these files at that commit:
 |---|---|
 | [PROTOCOL.md](https://github.com/joshualambert/obsbot-tiny3-linux/blob/d6ffc62ca0aa4e62e4100838a07339136f802b5a/PROTOCOL.md) | Lite identity, UVC topology, selectors, TLV tracking, status offsets, wake command, reply mailbox behavior, and sleep/streaming distinction |
 | `src/discover.rs` | Physical-camera discovery and variable video-node identity; its first-device selection was deliberately replaced with explicit ambiguity handling |
-| `src/device.rs` | Ordinary tracking category/submode, serial GET command, wake frame, sequence matching and bounded polling |
+| `src/device.rs` | Ordinary tracking category/submode, serial GET command, sleep/wake frames, sequence matching and bounded polling |
 | `src/controls.rs` | Standard UVC absolute zoom; its values are raw units, not magnification |
 | `src/frame.rs` | 60-byte V3 header, payload lengths, direction, flags and checksum coverage |
 | `src/crc.rs` | CRC-16/USB: reflected polynomial A001, initial FFFF, final XOR FFFF |
@@ -77,8 +77,12 @@ Vendor control uses XU entity **2**, 60-byte transfers:
   success but left native zoom unchanged. Tracking writes and zoom writes
   therefore wake first, if necessary, and confirm awake before controlling.
   Read-only zoom and serial queries do not wake the camera.
-- Wake: selector **2**, V3 flags `25`, receiver `02`, command `a0c2`, payload
-  `00 00 00 00`. The wake SET has no reply; confirmation uses status byte 2.
+- Power: selector **2**, V3 flags `25`, receiver `02`, command `a0c2`, payload
+  `00 00 00 00` wakes; `01 00 00 00` enters standby. These SETs have no reply;
+  confirmation uses status byte 2. `standby()` reads without waking, and
+  `set_standby(bool)` returns the confirmed state, skipping an unchanged write.
+  After a wake transition, the library allows two seconds for firmware startup
+  and rechecks awake before returning or sending subsequent controls.
 - Serial: selector 2, flags `01`, receiver `0d`, command `18c8`, no payload.
   Reply must have flags `29`, reversed endpoints, the exact sequence and
   command, valid header/payload lengths, and both CRCs. Old mailbox replies
@@ -97,9 +101,30 @@ Unrelated controllers do not honor this lock.
 
 Each USB request has a **1-second** timeout. State and reply polling use
 **3-second** deadlines with 50 ms sleeps; zoom settling has a **5-second**
-deadline. Separate wake/transition phases can add these times, and an in-flight
+deadline. Separate wake/transition phases and wake settling can add these times;
+an in-flight
 USB request can finish up to one transfer timeout after a poll deadline.
 All new reads validate lengths; an accepted SET alone never establishes success.
+
+## Standby, tracking modes, and HDR observations
+
+The full Tiny 3 accepted the reference sleep encoding. Separate processes
+confirmed asleep → awake → asleep with independent status reads. An immediate
+sleep after the awake flag cleared was ignored and correctly timed out;
+allowing two seconds after wake made that transition work. The library now
+includes that delay. Tracking remained off, native zoom remained 0 (1×), HDR
+flag remained 1, and the idle timer remained 120 seconds. This follow-up task
+started and ended asleep; its initial zoom was 1×, unlike the earlier zoom test.
+
+The reference's other tracking modes are group, hand, whiteboard, desk, and
+human framing variants upper body, close-up, headless, and lower body. Their
+category/submode encodings are documented in the reference `PROTOCOL.md`;
+only ordinary person tracking has been verified and exposed for the full Tiny 3.
+
+At this follow-up's start, the full camera's selector-6 status byte **6** was
+**1**, which the reference identifies as HDR enabled. This is a settings
+readback using the Lite's interpretation; HDR toggling and image comparisons
+have not been verified on the full Tiny 3. The HDR setting was left unchanged.
 
 ## Zoom calibration and firmware settling
 

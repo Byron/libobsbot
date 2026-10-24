@@ -12,6 +12,7 @@ use crate::{Device, Error, Result};
 
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(3);
 const POLL_DELAY: Duration = Duration::from_millis(50);
+const WAKE_SETTLE_DELAY: Duration = Duration::from_secs(2);
 static SEQUENCE: AtomicU16 = AtomicU16::new(0);
 
 fn next_sequence() -> u16 {
@@ -151,20 +152,47 @@ impl Device {
         }
     }
 
+    /// Read whether the Tiny 3 is in standby, without waking it.
+    pub fn standby(&self) -> Result<bool> {
+        self.require_tiny3()?;
+        let _transaction = self.transaction.lock().expect("transaction mutex poisoned");
+        tiny3::asleep(&self.tiny3_status()?)
+    }
+
+    /// Put the Tiny 3 in standby or wake it, and confirm its power state.
+    /// Returns `true` for confirmed standby and `false` for confirmed awake.
+    /// A wake transition includes two seconds for firmware startup to settle.
+    pub fn set_standby(&self, standby: bool) -> Result<bool> {
+        self.require_tiny3()?;
+        let _transaction = self.transaction.lock().expect("transaction mutex poisoned");
+        self.write_standby(standby)
+    }
+
     fn wake_for_control(&self) -> Result<()> {
-        if !tiny3::asleep(&self.tiny3_status()?)? {
-            return Ok(());
+        self.write_standby(false).map(|_| ())
+    }
+
+    fn write_standby(&self, standby: bool) -> Result<bool> {
+        if tiny3::asleep(&self.tiny3_status()?)? == standby {
+            return Ok(standby);
         }
         self.transport.uvc_set(
             tiny3::XU_ENTITY_ID,
             tiny3::XU_SEL_RPC,
-            &tiny3::build_wake_request(next_sequence()),
+            &tiny3::build_power_request(next_sequence(), standby),
         )?;
         let deadline = Instant::now() + CONFIRM_TIMEOUT;
         loop {
             std::thread::sleep(POLL_DELAY);
-            if !tiny3::asleep(&self.tiny3_status()?)? {
-                return Ok(());
+            if tiny3::asleep(&self.tiny3_status()?)? == standby {
+                if !standby {
+                    // Full Tiny 3 ignores sleep sent immediately after its awake flag clears.
+                    std::thread::sleep(WAKE_SETTLE_DELAY);
+                    if tiny3::asleep(&self.tiny3_status()?)? {
+                        return Err(Error::Timeout);
+                    }
+                }
+                return Ok(standby);
             }
             if Instant::now() >= deadline {
                 return Err(Error::Timeout);
@@ -319,6 +347,73 @@ mod tests {
     }
 
     #[test]
+    fn standby_confirms_both_transitions_and_preserves_tracking_and_zoom() {
+        let mut awake = status(2);
+        awake[4] = 17;
+        let mut asleep = awake.clone();
+        asleep[2] = 1;
+        let transport = Arc::new(ScriptedTransport::new(vec![
+            awake.clone(),
+            awake.clone(),
+            asleep.clone(),
+            asleep.clone(),
+            asleep,
+            awake.clone(),
+            awake.clone(),
+            awake,
+        ]));
+        let mut info = meet2_mock_info();
+        info.product_type = ProductType::Tiny3;
+        let d = Device::new(info, transport.clone(), None, [0; 6]);
+        assert!(d.set_standby(true).unwrap());
+        assert!(d.standby().unwrap());
+        assert!(!d.set_standby(false).unwrap());
+        assert!(!d.standby().unwrap());
+        let sets = transport.sets.lock().unwrap();
+        assert_eq!(sets.len(), 2);
+        for (set, value) in sets.iter().zip([1, 0]) {
+            assert_eq!((set.0, set.1), (2, 2));
+            assert_eq!(&set.2[10..12], &[0xc2, 0xa0]);
+            assert_eq!(&set.2[16..20], &[value, 0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn already_in_standby_needs_no_write_and_invalid_reads_fail() {
+        let mut asleep = status(0);
+        asleep[2] = 1;
+        let transport = Arc::new(ScriptedTransport::new(vec![asleep]));
+        let mut info = meet2_mock_info();
+        info.product_type = ProductType::Tiny3;
+        let d = Device::new(info, transport.clone(), None, [0; 6]);
+        assert!(d.set_standby(true).unwrap());
+        assert_eq!(transport.sets.lock().unwrap().len(), 0);
+        assert!(device(vec![vec![0x2e]]).set_standby(true).is_err());
+        assert!(crate::testing::device_with_mock()
+            .0
+            .set_standby(true)
+            .is_err());
+    }
+
+    #[test]
+    fn ignored_standby_write_times_out_instead_of_reporting_success() {
+        assert!(matches!(
+            device(vec![status(0); 100]).set_standby(true),
+            Err(Error::Timeout)
+        ));
+    }
+
+    #[test]
+    fn wake_rechecks_state_after_startup_settles() {
+        let mut asleep = status(0);
+        asleep[2] = 1;
+        assert!(matches!(
+            device(vec![asleep.clone(), status(0), asleep]).set_standby(false),
+            Err(Error::Timeout)
+        ));
+    }
+
+    #[test]
     fn zoom_conversion_and_quantization() {
         let scale = ZoomScale::new(0, 100, 1).unwrap();
         for (requested, native, achieved) in [
@@ -405,6 +500,7 @@ mod tests {
         let transport = Arc::new(ScriptedTransport::new(vec![
             asleep.clone(),
             asleep,
+            status(2),
             status(2),
             status(0),
         ]));
